@@ -1,0 +1,79 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - "rules/*.yml"
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+          - alertmanager:9093
+
+scrape_configs:
+  # Jenkins metrics
+  - job_name: 'jenkins'
+    static_configs:
+      - targets: ['jenkins-master:8080']
+    metrics_path: /prometheus
+    scrape_interval: 30s
+    scrape_timeout: 10s
+
+  # Node exporter for system metrics
+  - job_name: 'node-exporter'
+    static_configs:
+      - targets: ['jenkins-master:9100']
+    scrape_interval: 15s
+
+  # Docker metrics
+  - job_name: 'docker'
+    static_configs:
+      - targets: ['jenkins-master:9323']
+    scrape_interval: 15s
+
+  # Prometheus self-monitoring
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+    scrape_interval: 15s
+
+  # Selenium metrics
+  - job_name: 'selenium'
+    static_configs:
+      - targets: ['selenium-chrome:4444']
+    metrics_path: /metrics
+    scrape_interval: 30s
+
+  # Nginx metrics
+  - job_name: 'nginx'
+    static_configs:
+      - targets: ['nginx:9113']
+    scrape_interval: 15s
+
+  # Redis metrics
+  - job_name: 'redis'
+    static_configs:
+      - targets: ['redis:6379']
+    scrape_interval: 15s
+
+  # PostgreSQL metrics
+  - job_name: 'postgres'
+    static_configs:
+      - targets: ['postgres:9187']
+    scrape_interval: 15s
+
+  # Elasticsearch metrics
+  - job_name: 'elasticsearch'
+    static_configs:
+      - targets: ['elasticsearch:9200']
+    metrics_path: /_prometheus/metrics
+    scrape_interval: 30s
+
+  # Security scan metrics
+  - job_name: 'security-scans'
+    static_configs:
+      - targets: ['jenkins-master:8080']
+    metrics_path: /security-metrics
+    scrape_interval: 60s
+    scrape_timeout: 30s 
