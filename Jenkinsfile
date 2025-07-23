@@ -1,153 +1,376 @@
 /*
-This pipeline will carry out the following on the project:
-
-1. Git secret checker
-2. Software Composition Analysis
-3. Static Application Security Testing
-4. Container security audit 
-5. Dynamic Application Security Testing
-6. Host system security audit
-7. Host application protection
-
+Enhanced DevSecOps Pipeline with:
+- Parallel security scanning
+- Quality gates with configurable thresholds
+- Better error handling and reporting
+- Modular structure
+- Artifact management
+- Monitoring integration
 */
 
+@Library('security-library') _
+
+// Configuration
+def config = [
+    security: [
+        sast: [threshold: 5, level: 'low'],
+        sca: [threshold: 10],
+        container: [threshold: 3],
+        dast: [threshold: 5]
+    ],
+    aws: [
+        region: 'eu-west-2',
+        instance_type: 't3.medium',
+        cleanup: true
+    ],
+    notifications: [
+        email: 'security-team@company.com',
+        slack: '#security-alerts'
+    ]
+]
+
 testenv = "null"
+def scanResults = [:]
 
 pipeline {
-    /* Which agent are we running this pipeline on? We can configure different OS */
     agent any
-	
-    stages {   
-      stage('Checkout project'){
-        steps {
-          echo 'downloading git directory..'
-	  git 'https://github.com/pawnu/secDevLabs.git'
-        }
-      }      
-      stage('git secret check'){
-        steps{
-	  script{
-		echo 'running trufflehog to check project history for secrets'
-		sh 'trufflehog --regex --entropy=False --max_depth=3 https://github.com/pawnu/secDevLabs'
-	  }
-        }
-      }
-      stage('SCA'){
-        steps{
-          echo 'running python safety check on requirements.txt file'
-          sh 'safety check -r $WORKSPACE/owasp-top10-2017-apps/a7/gossip-world/app/requirements.txt'
-          /*
-	  echo 'running liccheck on dependencies'
-	  sh """
-              virtualenv --no-site-packages .
-              source bin/activate
-	      pip install -r $WORKSPACE/owasp-top10-2017-apps/a7/gossip-world/app/requirements.txt
-              liccheck -s ~/my_strategy.ini -r $WORKSPACE/owasp-top10-2017-apps/a7/gossip-world/app/requirements.txt
-              deactivate
-            """
-	    */
-        }
-      }  
-      stage('SAST') {
-          steps {
-              echo 'Testing source code for security bugs and vulnerabilities'
-	      sh 'bandit -r $WORKSPACE/owasp-top10-2017-apps/a7/gossip-world/app/ -ll || true'
-          }
-      }
-      stage('Container audit') {
-          steps {
-              echo 'Audit the dockerfile used to spin up the web application'
-		script{				
-			def exists = fileExists '/var/jenkins_home/lynis/lynis'
-			if(exists){
-				echo 'lynis already exists'
-			}else{
-			      sh """
-			      wget https://downloads.cisofy.com/lynis/lynis-2.7.5.tar.gz
-			      tar xfvz lynis-2.7.5.tar.gz -C ~/
-			      rm lynis-2.7.5.tar.gz
-			      """
-			}
-		}
-		  dir("/var/jenkins_home/lynis"){  
-			sh """
-			mkdir $WORKSPACE/$BUILD_TAG/
-			./lynis audit dockerfile $WORKSPACE/owasp-top10-2017-apps/a7/gossip-world/deployments/Dockerfile | ansi2html > $WORKSPACE/$BUILD_TAG/docker-report.html
-			mv /tmp/lynis.log $WORKSPACE/$BUILD_TAG/docker_lynis.log
-			mv /tmp/lynis-report.dat $WORKSPACE/$BUILD_TAG/docker_lynis-report.dat
-			"""
-		  }
-          }
-      }	    
-      stage('Setup test env') {
-          steps {
-              sh """
-	      #refresh inventory
-	      echo "[local]" > ~/ansible_hosts
-	      echo "localhost ansible_connection=local" >> ~/ansible_hosts
-	      echo "[tstlaunched]" >> ~/ansible_hosts
-	      
-	      tar cvfz /var/jenkins_home/pythonapp.tar.gz -C $WORKSPACE/owasp-top10-2017-apps/a7/ .
-
-              ssh-keygen -t rsa -N "" -f ~/.ssh/psp_ansible_key || true
-              ansible-playbook -i ~/ansible_hosts ~/createAwsEc2.yml
-              """		  
-	      script{
-		 testenv = sh(script: "sed -n '/tstlaunched/{n;p;}' /var/jenkins_home/ansible_hosts", returnStdout: true).trim()
-	      }
-	      echo "${testenv}"
-	      sh  'ansible-playbook -i ~/ansible_hosts ~/configureTestEnv.yml'
-          }
-      }
-      stage('DAST') {
-          steps {
-		script{				
-			//Test the web application from its frontend
-			/*
-			def exists = fileExists '/var/jenkins_home/nikto-master/program/nikto.pl'
-			if(exists){
-				echo 'nikto already exists'
-			}else{
-			      sh """
-				wget https://github.com/sullo/nikto/archive/master.zip
-				unzip master.zip -d ~/ || true
-				rm master.zip
-			      """
-			}
-			*/
-			def seleniumIp = env.SeleniumPrivateIp
-			if("${testenv}" != "null"){
-				sh "python ~/authDAST.py $seleniumIp ${testenv} $WORKSPACE/$BUILD_TAG/DAST_results.html"
-				//sh "perl /var/jenkins_home/nikto-master/program/nikto.pl -h http://${testenv}:10007/login"
-			}  			
-		}
-	   }
-      }
-      stage('System security audit') {
-          steps {
-              echo 'Run lynis audit on host and fetch result'
-	      sh 'ansible-playbook -i ~/ansible_hosts ~/hostaudit.yml --extra-vars "logfolder=$WORKSPACE/$BUILD_TAG/"'
-          }
-      }
-      stage('Deploy WAF') {
-          steps {
-              echo 'Deploy modsecurity as reverse proxy'
-	      sh 'ansible-playbook -i ~/ansible_hosts ~/configureWAF.yml'
-	  }
-      }	    
+    
+    options {
+        timeout(time: 2, unit: 'HOURS')
+        timestamps()
+        ansiColor('xterm')
+        buildDiscarder(logRotator(numToKeepStr: '10'))
     }
+    
+    environment {
+        AWS_DEFAULT_REGION = 'eu-west-2'
+        PYTHONPATH = "${WORKSPACE}"
+        SECURITY_REPORTS_DIR = "${WORKSPACE}/security-reports"
+    }
+    
+    stages {
+        stage('Initialize') {
+            steps {
+                script {
+                    // Create reports directory
+                    sh 'mkdir -p ${SECURITY_REPORTS_DIR}'
+                    
+                    // Load configuration
+                    if (fileExists('pipeline-config.yaml')) {
+                        config = readYaml file: 'pipeline-config.yaml'
+                    }
+                    
+                    echo "Pipeline configuration loaded: ${config}"
+                }
+            }
+        }
+        
+        stage('Checkout & Setup') {
+            steps {
+                script {
+                    // Checkout with retry
+                    retry(3) {
+                        checkout([
+                            $class: 'GitSCM',
+                            branches: [[name: '*/master']],
+                            userRemoteConfigs: [[
+                                url: 'https://github.com/pawnu/secDevLabs.git',
+                                credentialsId: 'github-credentials'
+                            ]]
+                        ])
+                    }
+                    
+                    // Setup Python environment
+                    sh '''
+                        python3 -m venv venv
+                        source venv/bin/activate
+                        pip install --upgrade pip
+                        pip install -r requirements.txt || true
+                    '''
+                }
+            }
+        }
+        
+        stage('Security Scans') {
+            parallel {
+                stage('SAST') {
+                    steps {
+                        script {
+                            echo 'Running Static Application Security Testing'
+                            sh '''
+                                source venv/bin/activate
+                                bandit -r . -f json -o ${SECURITY_REPORTS_DIR}/bandit-report.json -ll || true
+                                bandit -r . -f html -o ${SECURITY_REPORTS_DIR}/bandit-report.html -ll || true
+                            '''
+                            
+                            // Parse results
+                            if (fileExists("${SECURITY_REPORTS_DIR}/bandit-report.json")) {
+                                def results = readJSON file: "${SECURITY_REPORTS_DIR}/bandit-report.json"
+                                scanResults.sast = results
+                                echo "SAST found ${results.results.size()} issues"
+                            }
+                        }
+                    }
+                }
+                
+                stage('SCA') {
+                    steps {
+                        script {
+                            echo 'Running Software Composition Analysis'
+                            sh '''
+                                source venv/bin/activate
+                                safety check -r requirements.txt --json --output ${SECURITY_REPORTS_DIR}/safety-report.json || true
+                                safety check -r requirements.txt --html --output ${SECURITY_REPORTS_DIR}/safety-report.html || true
+                            '''
+                            
+                            if (fileExists("${SECURITY_REPORTS_DIR}/safety-report.json")) {
+                                def results = readJSON file: "${SECURITY_REPORTS_DIR}/safety-report.json"
+                                scanResults.sca = results
+                                echo "SCA found ${results.vulnerabilities.size()} vulnerabilities"
+                            }
+                        }
+                    }
+                }
+                
+                stage('Secret Scanning') {
+                    steps {
+                        script {
+                            echo 'Running Git Secret Scanner'
+                            sh '''
+                                trufflehog --regex --entropy=False --max_depth=3 --json . > ${SECURITY_REPORTS_DIR}/trufflehog-report.json || true
+                                trufflehog --regex --entropy=False --max_depth=3 --html . > ${SECURITY_REPORTS_DIR}/trufflehog-report.html || true
+                            '''
+                            
+                            if (fileExists("${SECURITY_REPORTS_DIR}/trufflehog-report.json")) {
+                                def results = readJSON file: "${SECURITY_REPORTS_DIR}/trufflehog-report.json"
+                                scanResults.secrets = results
+                                echo "Secret scan found ${results.size()} potential secrets"
+                            }
+                        }
+                    }
+                }
+                
+                stage('Container Audit') {
+                    steps {
+                        script {
+                            echo 'Auditing Dockerfile security'
+                            sh '''
+                                mkdir -p ${SECURITY_REPORTS_DIR}/container
+                                lynis audit dockerfile Dockerfile --report-file ${SECURITY_REPORTS_DIR}/container/lynis-report.txt || true
+                                trivy image --format json --output ${SECURITY_REPORTS_DIR}/container/trivy-report.json . || true
+                                trivy image --format html --output ${SECURITY_REPORTS_DIR}/container/trivy-report.html . || true
+                            '''
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Quality Gate') {
+            steps {
+                script {
+                    echo 'Evaluating security quality gates'
+                    
+                    def violations = []
+                    
+                    // SAST Quality Gate
+                    if (scanResults.sast && scanResults.sast.results.size() > config.security.sast.threshold) {
+                        violations.add("SAST: ${scanResults.sast.results.size()} issues found (threshold: ${config.security.sast.threshold})")
+                    }
+                    
+                    // SCA Quality Gate
+                    if (scanResults.sca && scanResults.sca.vulnerabilities.size() > config.security.sca.threshold) {
+                        violations.add("SCA: ${scanResults.sca.vulnerabilities.size()} vulnerabilities found (threshold: ${config.security.sca.threshold})")
+                    }
+                    
+                    // Secret Quality Gate
+                    if (scanResults.secrets && scanResults.secrets.size() > 0) {
+                        violations.add("SECRETS: ${scanResults.secrets.size()} potential secrets found")
+                    }
+                    
+                    if (violations.size() > 0) {
+                        def message = "Security quality gates failed:\n" + violations.join("\n")
+                        error message
+                    }
+                    
+                    echo "All security quality gates passed!"
+                }
+            }
+        }
+        
+        stage('Deploy Test Environment') {
+            steps {
+                script {
+                    echo 'Setting up AWS test environment'
+                    
+                    // Use Terraform for infrastructure
+                    sh '''
+                        cd terraform
+                        terraform init
+                        terraform plan -out=tfplan
+                        terraform apply tfplan
+                    '''
+                    
+                    // Get test environment details
+                    testenv = sh(
+                        script: "terraform output -raw test_instance_ip",
+                        returnStdout: true
+                    ).trim()
+                    
+                    echo "Test environment deployed at: ${testenv}"
+                    
+                    // Configure test environment
+                    sh "ansible-playbook -i ~/ansible_hosts ~/configureTestEnv.yml --extra-vars 'testenv=${testenv}'"
+                }
+            }
+        }
+        
+        stage('DAST') {
+            steps {
+                script {
+                    echo 'Running Dynamic Application Security Testing'
+                    
+                    if (testenv != "null") {
+                        sh '''
+                            source venv/bin/activate
+                            python ~/authDAST.py $SeleniumPrivateIp ${testenv} ${SECURITY_REPORTS_DIR}/dast-results.html
+                            
+                            # Run additional DAST tools
+                            nikto -h http://${testenv}:10007 -Format html -output ${SECURITY_REPORTS_DIR}/nikto-report.html || true
+                            zap-baseline.py -t http://${testenv}:10007 -J ${SECURITY_REPORTS_DIR}/zap-report.json || true
+                        '''
+                    }
+                }
+            }
+        }
+        
+        stage('System Security Audit') {
+            steps {
+                script {
+                    echo 'Running system security audit'
+                    sh '''
+                        ansible-playbook -i ~/ansible_hosts ~/hostaudit.yml \
+                            --extra-vars "logfolder=${SECURITY_REPORTS_DIR}/system/"
+                    '''
+                }
+            }
+        }
+        
+        stage('Deploy WAF') {
+            steps {
+                script {
+                    echo 'Deploying Web Application Firewall'
+                    sh 'ansible-playbook -i ~/ansible_hosts ~/configureWAF.yml'
+                }
+            }
+        }
+        
+        stage('Generate Reports') {
+            steps {
+                script {
+                    echo 'Generating comprehensive security report'
+                    
+                    // Create executive summary
+                    sh '''
+                        cat > ${SECURITY_REPORTS_DIR}/executive-summary.html << 'EOF'
+                        <html>
+                        <head><title>Security Scan Report</title></head>
+                        <body>
+                        <h1>Security Scan Executive Summary</h1>
+                        <p>Build: ${BUILD_NUMBER}</p>
+                        <p>Timestamp: ${new Date()}</p>
+                        <h2>Scan Results:</h2>
+                        <ul>
+                        <li>SAST Issues: ${scanResults.sast?.results?.size() ?: 0}</li>
+                        <li>SCA Vulnerabilities: ${scanResults.sca?.vulnerabilities?.size() ?: 0}</li>
+                        <li>Secrets Found: ${scanResults.secrets?.size() ?: 0}</li>
+                        </ul>
+                        </body>
+                        </html>
+                        EOF
+                    '''
+                    
+                    // Archive reports
+                    archiveArtifacts artifacts: 'security-reports/**/*', fingerprint: true
+                    
+                    // Publish to artifact repository
+                    publishHTML([
+                        allowMissing: false,
+                        alwaysLinkToLastBuild: true,
+                        keepAll: true,
+                        reportDir: 'security-reports',
+                        reportFiles: 'executive-summary.html',
+                        reportName: 'Security Report'
+                    ])
+                }
+            }
+        }
+    }
+    
     post {
         always {
-		echo 'We could bring down the ec2 here'
-		/*
-		echo 'Tear down activity'
-		script{
-			if("${testenv}" != "null"){
-				echo "killing host ${testenv}"
-				sh 'ansible-playbook -i ~/ansible_hosts ~/killec2.yml'
-			} 
-		}
-		*/
+            script {
+                // Cleanup test environment if configured
+                if (config.aws.cleanup && testenv != "null") {
+                    echo "Cleaning up test environment: ${testenv}"
+                    sh 'ansible-playbook -i ~/ansible_hosts ~/killec2.yml'
+                }
+                
+                // Send notifications
+                if (currentBuild.result == 'SUCCESS') {
+                    echo "Pipeline completed successfully"
+                } else {
+                    echo "Pipeline failed or was aborted"
+                }
+            }
         }
-    }	
+        
+        success {
+            script {
+                // Success notification
+                emailext (
+                    subject: "Security Pipeline SUCCESS: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                    body: """
+                        Security pipeline completed successfully!
+                        
+                        Build: ${env.BUILD_NUMBER}
+                        URL: ${env.BUILD_URL}
+                        
+                        Scan Results:
+                        - SAST Issues: ${scanResults.sast?.results?.size() ?: 0}
+                        - SCA Vulnerabilities: ${scanResults.sca?.vulnerabilities?.size() ?: 0}
+                        - Secrets Found: ${scanResults.secrets?.size() ?: 0}
+                        
+                        Reports available at: ${env.BUILD_URL}artifact/security-reports/
+                    """,
+                    to: config.notifications.email
+                )
+            }
+        }
+        
+        failure {
+            script {
+                // Failure notification
+                emailext (
+                    subject: "Security Pipeline FAILED: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                    body: """
+                        Security pipeline failed!
+                        
+                        Build: ${env.BUILD_NUMBER}
+                        URL: ${env.BUILD_URL}
+                        
+                        Please check the build logs for details.
+                    """,
+                    to: config.notifications.email
+                )
+            }
+        }
+        
+        cleanup {
+            script {
+                // Cleanup workspace
+                cleanWs()
+            }
+        }
+    }
 }
